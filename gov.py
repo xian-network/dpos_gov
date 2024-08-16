@@ -16,8 +16,8 @@ Actions = Hash()  # Actions, using action core pattern
 Validators = Hash(default_value=0)
 
 """
-    Validators:<address>: bool
-        - If the validator can be included in the active set. Falsey if validator has left.
+    Validators:<address>:active: bool
+        - If the validator can be included in the active set. False if validator has left.
     
     Validators:<address>:locked: None or float 
         - The amount of tokens locked by the validator
@@ -40,11 +40,10 @@ Validators = Hash(default_value=0)
 
 ValidatorsActive = Hash()  # Validators Active - A list of validators in the active set.
 
-StakingEpochs = Hash()  # Staking Epochs
-Epoch_I = Hash(
-    default_value=0
-)  # Epoch Index - The index tracking the current epoch : int
-Delegators = Hash()  # Delegations:<delegator_account>:<validator_account> : float
+# StakingEpochs = Hash()  # Staking Epochs
+Epoch_I = Variable()  # Epoch Index - The index tracking the current epoch : int
+Delegators = Hash(default_value=0)  # Delegations:<delegator_account>:<validator_account> : float
+TotalPower = Variable()  # Total Power - The total voting power among all validators : float
 
 Rules = (
     Hash()
@@ -77,6 +76,8 @@ DEFAULT_RULES = {
     "fee_dist": [0.0, 0.0, 0.0, 0.0],
     "unbonding_period": 0,
     "epoch_length": 0,
+    "min_vote_turnout": 0.0,
+    "min_vote_ratio": 0.0,
 }
 
 
@@ -89,86 +90,110 @@ def seed(genesis_nodes: list, rules: dict = {}):
     Rules["unbonding_period"] = rules.get("unbonding_period", DEFAULT_RULES["unbonding_period"])
     Rules["epoch_length"] = rules.get("epoch_length", DEFAULT_RULES["epoch_length"])
     
+    Epoch_I.set(0)
+    TotalPower.set(0)
+    
     for node in genesis_nodes:
-        Validators[node] = True
-        Validators[node, "locked"] = Rules["join_fee"]
+        Validators[node, 'active'] = True
+        Validators[node, "locked"] = Rules["v_lock"]
         Validators[node, "unbonding"] = None
-        Validators[node, "power"] = Rules["join_fee"]
-        Validators[node, "commission"] = Rules["min_commission"]
+        Validators[node, "power"] = Rules["v_lock"]
+        Validators[node, "commission"] = Rules["v_min_commission"]
         Validators[node, "epoch_joined"] = 0
         Validators[node, "epoch_collected"] = None
         Validators[node, "is_genesis_node"] = True # Not returned tokens on leave.
+        TotalPower.set(TotalPower.get() + Rules["v_lock"])
 
 
 @export
 def join(commission: float):
-    assert Validators[ctx.caller], "Already a validator"
+    assert not Validators[ctx.caller, 'active'], "Already a validator"
+    
+    join_fee = Rules["v_lock"]
 
-    assert currency["balances"][ctx.caller] >= join_fee, "Insufficient funds to join"
-
+    assert currency.balance_of(ctx.caller) >= join_fee, "Insufficient funds to join"
     min_commission = Rules["v_min_commission"]
 
     assert commission >= min_commission, f"Commission must be at least {min_commission}"
 
-    join_fee = Rules["join_fee"]
-
     currency.transfer_from(amount=join_fee, to=ctx.this, main_account=ctx.caller)
 
-    Validators[ctx.caller] = True
+    Validators[ctx.caller, 'active'] = True
     Validators[ctx.caller, "locked"] = join_fee
     Validators[ctx.caller, "unbonding"] = None
-    Validators[ctx.caller, "power"] = join_fee
+    Validators[ctx.caller, "power"] += join_fee
     Validators[ctx.caller, "commission"] = commission
-    Validators[ctx.caller, "epoch_joined"] = Epoch_I + 1
+    Validators[ctx.caller, "epoch_joined"] = Epoch_I.get() + 1
     Validators[ctx.caller, "epoch_collected"] = None
     Validators[ctx.caller, "is_genesis_node"] = None
+    
+    TotalPower.set(TotalPower.get() + join_fee)
 
 
 @export
 def announce_validator_leave():
-    assert Validators[ctx.caller], "Not a validator"
+    assert Validators[ctx.caller, 'active'], "Not a validator"
     assert not Validators[ctx.caller, "unbonding"], "Already unbonding"
 
     Validators[ctx.caller, "unbonding"] = now + datetime.timedelta(
         days=Rules["unbonding_period"]
     )
-    # Validators[ctx.caller, "power"] = 0
 
 
 @export
 def cancel_validator_leave():
-    assert Validators[ctx.caller], "Not a validator"
-    assert Validators[ctx.caller, "unbonding"] is not None, "Not unbonding"
+    assert Validators[ctx.caller, 'active'], "Not an active validator"
+    assert Validators[ctx.caller, "unbonding"], "Not unbonding"
 
     Validators[ctx.caller, "unbonding"] = None
-    # Validators[ctx.caller, "power"] = Validators[ctx.caller, "locked"]
 
 
 @export
 def validator_leave():
-    assert Validators[ctx.caller], "Not a validator"
+    assert Validators[ctx.caller, 'active'], "Not a validator"
     assert Validators[ctx.caller, "unbonding"], "Not unbonding"
-    assert Validators[ctx.caller, "unbonding"] < now, "Unbonding period not over"
+    assert Validators[ctx.caller, "unbonding"] <= now, "Unbonding period not over"
 
     # perform the transfer
     if not Validators[ctx.caller, "is_genesis_node"]:
         currency.transfer(Validators[ctx.caller, "locked"], ctx.caller)
-    Validators[ctx.caller, "locked"] = None
-
+        
     # reset the validator record.
-    Validators[ctx.caller] = None
+    Validators[ctx.caller, 'active'] = False
+    Validators[ctx.caller, "unbonding"] = None
+    Validators[ctx.caller, "power"] -= Validators[ctx.caller, "locked"]
+    Validators[ctx.caller, "locked"] = None
+    Validators[ctx.caller, "is_genesis_node"] = None
+    
+    TotalPower.set(TotalPower.get() - Validators[ctx.caller, "locked"])
 
 
 @export
 def delegate(validator: str, amount: float):
-    assert Validators[validator], "Validator is not registered"
+    """
+    Called by : Delegator
+    * Delegates tokens to a validator.
+    * Increases the voting power of the validator.
+    * Cannot delegate to a validator that is unbonding.
+    * Cannot delegate to a validator if caller has a delegation to validator that is unbonding.
+    * Value must be greater than 0.
+    """
+    assert amount > 0, "Amount must be greater than 0"
+    assert Validators[validator, 'active'], "Validator is not registered"
     assert not Validators[validator, "unbonding"], "Validator is unbonding"
-    assert currency["balances", ctx.caller] >= amount, "Insufficient funds"
+    assert not Delegators[ctx.caller, validator, "unbonding"], "This delegation is unbonding, please cancel the unbonding period first"
+    
+    currency_balances = ForeignHash(foreign_contract="currency", foreign_name="balances")
+    assert currency_balances[ctx.caller] >= amount, "Insufficient funds"
+    assert currency_balances[ctx.caller, ctx.this] >= amount, "Insufficient allowance"
 
     currency.transfer_from(amount=amount, to=ctx.this, main_account=ctx.caller)
 
     Delegators[ctx.caller, validator, "amount"] += amount
+    Delegators[ctx.caller, validator, "epoch_joined"] = Epoch_I.get() + 1
     Validators[validator, "power"] += amount
+    
+    TotalPower.set(TotalPower.get() + amount)
 
 
 @export
@@ -180,11 +205,11 @@ def announce_delegator_leave(validator: str):
     * If the validator is not unbonding, the delegated tokens can be claimed after the standard unbonding period, defined in Rules.
     * If the validator is no longer registered, the delegated tokens can be claimed immediately / unbonding period set to now.
     """
-    assert Delegators[ctx.caller, validator] > 0, "No delegation to leave"
+    assert Delegators[ctx.caller, validator, "amount"] > 0, "No delegation to leave"
     assert not Delegators[ctx.caller, validator, "unbonding"], "Already unbonding"
 
     # Validator has left the network
-    if not Validators[validator]:
+    if not Validators[validator, 'active']:
         currency.transfer(Delegators[ctx.caller, validator, "amount"], ctx.caller)
         Validators[validator, "power"] -= Delegators[ctx.caller, validator, "amount"]
         Delegators[ctx.caller, validator, "amount"] = 0
@@ -197,7 +222,7 @@ def announce_delegator_leave(validator: str):
         return
 
     # Validator is not unbonding
-    Delegators[ctx.caller, validator, "unbonding"] = now + Rules["unbonding_period"]
+    Delegators[ctx.caller, validator, "unbonding"] = now + datetime.timedelta(days=Rules["unbonding_period"])
     Validators[validator, "power"] -= Delegators[ctx.caller, validator, "amount"]
 
 
@@ -207,7 +232,7 @@ def cancel_delegator_leave(validator: str):
     Called by : Delegator
     * Cancels the unbonding period for a delegation.
     """
-    assert Delegators[ctx.caller, validator] > 0, "No delegation to leave"
+    assert Delegators[ctx.caller, validator, 'amount'] > 0, "No delegation to leave"
     assert Delegators[ctx.caller, validator, "unbonding"], "Not unbonding"
 
     Delegators[ctx.caller, validator, "unbonding"] = None
@@ -219,14 +244,20 @@ def redelegate(from_validator: str, to_validator: str, amount: float):
     """
     Called by : Delegator
     * Moves tokens delegated from one validator to another.
+    * Can be performed when there is a delegation to the from_validator.
+    * Can be performed when the to_validator is not unbonding and is active.
+    * Cannot be performed when the delegator is unbonding from the validator.
+    * Cannot be performed when the delegator is unbonding from the to_validator.
     """
-    assert Validators[from_validator], "From validator is not registered"
-    assert Validators[to_validator], "To validator is not registered"
-    # assert not Validators[from_validator, "unbonding"], "From validator is unbonding"
+    # Validator Checks
+    assert Validators[to_validator, 'active'], "To validator is not active"
     assert not Validators[to_validator, "unbonding"], "To validator is unbonding"
-    assert Delegators[ctx.caller, from_validator] > 0, "No delegation to move"
-    assert not Delegators[ctx.caller, from_validator, "unbonding"], "This delegation is unbonding, please cancel the unbonding period first"
-    assert Delegators[ctx.caller, from_validator] >= amount, "Insufficient delegation"
+    
+    # Delegator Checks
+    assert Delegators[ctx.caller, from_validator, 'amount'] > 0, "No delegation to move"
+    assert Delegators[ctx.caller, from_validator, 'amount'] >= amount, "Insufficient delegation"
+    assert not Delegators[ctx.caller, from_validator, "unbonding"], "The 'from' delegation is unbonding, cancel the unbonding first"
+    assert not Delegators[ctx.caller, to_validator, "unbonding"], "The 'to' delegation is unbonding, cancel the unbonding first"
 
     Delegators[ctx.caller, from_validator, "amount"] -= amount
     Delegators[ctx.caller, to_validator, "amount"] += amount
@@ -234,6 +265,23 @@ def redelegate(from_validator: str, to_validator: str, amount: float):
     Validators[to_validator, "power"] += amount
     
     
+@export
+def delegator_leave(validator: str):
+    """
+    Called by : Delegator
+    * Can be called after the unbonding period
+    """
+    assert Delegators[ctx.caller, validator, 'amount'] > 0, "No delegation to leave"
+    assert Delegators[ctx.caller, validator, "unbonding"], 'Not unbonding, call announce_delegator_leave first'
+    assert Delegators[ctx.caller, validator, "unbonding"] <= now, 'Unbonding period not over'
+    
+    currency.transfer(Delegators[ctx.caller, validator, "amount"], ctx.caller)
+    
+    Delegators[ctx.caller, validator, "amount"] = 0
+    Delegators[ctx.caller, validator, "unbonding"] = None
+    Delegators[ctx.caller, validator, "validator"] = None
+
+
 # @export
 # def propose(type_of_vote: str, arg: Any):
 #     assert ctx.caller in VA.get(), "Only nodes can propose new votes"

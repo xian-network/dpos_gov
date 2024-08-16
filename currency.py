@@ -46,7 +46,7 @@ def transfer(amount: float, to: str):
 @export
 def approve(amount: float, to: str):
     assert amount > 0, 'Cannot send negative balances.'
-    balances[ctx.caller, to] += amount
+    balances[ctx.caller, to] = amount
 
     return f"Approved {amount} for {to}"
 
