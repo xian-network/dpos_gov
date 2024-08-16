@@ -8,7 +8,7 @@ To run tests :
    1. `make contracting-dev-build`
    2. `make contracting-dev-shell`
 4. From shell :
-   1. `cd contracts/xian_dpos`
+   1. `cd contracts/dpos_gov`
    2. `pytest`
 
 TO-DO : 
