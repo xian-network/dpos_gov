@@ -5,21 +5,33 @@ permits = Hash()
 # XST003
 streams = Hash()
 
+supply = Variable()
+issuer = Variable()
 
 @construct
-def seed(vk: str):
+def seed(vk: str, gov_contract: str):
     balances[vk] = 5555555.55 # 5% Team Tokens
     balances["team_lock"] = 16666666.65 # 15% Team Tokens 5 Year Release, Directly minted into Lock contract
     balances["dao"] = 33333333.3 # 30% DAO Tokens, Directly minted into DAO contract
     balances[vk] += 49999999.95 # 45% Second batch of public tokens, to be sent out after mint
     balances[vk] += 5555555.55 # 5% First batch of public tokens, to be sent out after mint
-
+        
     # TEAM LOCK
     # 365 * 4 + 364 = 1824 (4 years + 1 leap-year)
     # 1824 * 24 * 60 * 60 = 157593600 (seconds in duration)
     # 16666666.65 / 157593600 (release per second)
     
     setup_seed_stream("team_lock", "team_lock", vk, 0.10575725568804825, 1824)
+
+    supply.set(111111111)
+    issuer.set(gov_contract)
+
+
+@export
+def issue(amount: float):
+    assert ctx.caller == issuer.get(), 'Only the minter can mint new tokens.'
+    supply.set(supply.get() + amount)
+    balances[issuer.get()] += amount
 
 
 def setup_seed_stream(stream_id: str, sender: str, receiver: str, rate: float, duration_days: int):

@@ -38,16 +38,29 @@ Validators = Hash(default_value=0)
         - The index of the last epoch which rewards were collected for.
 """
 
-ValidatorsActive = Hash()  # Validators Active - A list of validators in the active set.
+Delegators = Hash(default_value=0)
+"""
+Delegators:<address>:<validator>:amount: float
+    - The current amount of tokens delegated to the validator.
+Delegators:<address>:<validator>:epoch_joined: int
+    - The point when the delegator joined the validator.
+Delegators:<address>:<validator>:unbonding: Date or None
+Delegators:<address>:<validator>:validator:p_record: Dict
+    - A record of changes in the delegation to this validator.
+    {
+        [epoch]: [amount]
+    }
+"""
 
-# StakingEpochs = Hash()  # Staking Epochs
+
+
+
+StakingEpochs = Hash()  # Staking Epochs
 Epoch_I = Variable()  # Epoch Index - The index tracking the current epoch : int
-Delegators = Hash(default_value=0)  # Delegations:<delegator_account>:<validator_account> : float
 TotalPower = Variable()  # Total Power - The total voting power among all validators : float
+ActivePower = Variable()  # Active Power - The total voting power among all active validators : float
 
-Rules = (
-    Hash()
-)  # This state is used to store the rules for the network. Alterable via governance votes.
+Rules = Hash() # This state is used to store the rules for the network. Alterable via governance votes.
 """
     {
         v_max: int, # The maximum number of validators in the active set.
@@ -60,6 +73,18 @@ Rules = (
         min_vote_ratio: float, # The minimum percentage of validators that must vote yes for a proposal to be valid.
     }
 """
+IssuanceRules = Hash(default_value=0) # IssuanceRules:rule_name: float
+"""
+    {
+        staked_target: float, # The target % of circulating supply to be staked
+        reward_steepness: float, # The steepness of the reward curve
+        reward_min: float, # The minimum reward percentage
+        reward_max: float, # The maximum reward percentage
+        reward_target: float, # The target reward percentage
+    }
+"""
+
+
 
 # Votes = Hash(
 #     default_value=False
@@ -89,9 +114,12 @@ def seed(genesis_nodes: list, rules: dict = {}):
     Rules["fee_dist"] = rules.get("fee_dist", DEFAULT_RULES["fee_dist"])
     Rules["unbonding_period"] = rules.get("unbonding_period", DEFAULT_RULES["unbonding_period"])
     Rules["epoch_length"] = rules.get("epoch_length", DEFAULT_RULES["epoch_length"])
+    Rules["min_vote_turnout"] = rules.get("min_vote_turnout", DEFAULT_RULES["min_vote_turnout"])
+    Rules["min_vote_ratio"] = rules.get("min_vote_ratio", DEFAULT_RULES["min_vote_ratio"])
     
     Epoch_I.set(0)
     TotalPower.set(0)
+    ActivePower.set(0)
     
     for node in genesis_nodes:
         Validators[node, 'active'] = True
@@ -103,6 +131,11 @@ def seed(genesis_nodes: list, rules: dict = {}):
         Validators[node, "epoch_collected"] = None
         Validators[node, "is_genesis_node"] = True # Not returned tokens on leave.
         TotalPower.set(TotalPower.get() + Rules["v_lock"])
+        
+        StakingEpochs[0, node] = Rules["v_lock"]
+                
+        Validators[node, "active"] = True
+        ActivePower.set(ActivePower.get() + Rules["v_lock"])
 
 
 @export
@@ -128,6 +161,19 @@ def join(commission: float):
     Validators[ctx.caller, "is_genesis_node"] = None
     
     TotalPower.set(TotalPower.get() + join_fee)
+
+
+def copy_from_hash(from_h, to_h, items: list):
+    dict_items = {}
+    for item in items:
+        from_value = from_h[*item]
+        to_h[*item] = from_value
+
+
+def write_to_hash(h, items: dict):
+    keys = items.keys()
+    for k in keys:
+        h[k] = items[k]
 
 
 @export
@@ -191,6 +237,10 @@ def delegate(validator: str, amount: float):
 
     Delegators[ctx.caller, validator, "amount"] += amount
     Delegators[ctx.caller, validator, "epoch_joined"] = Epoch_I.get() + 1
+    Delegators[ctx.caller, validator, "unbonding"] = None
+    Delegators[ctx.caller, validator, "record"] = {
+        Epoch_I.get() + 1: amount
+    }
     Validators[validator, "power"] += amount
     
     TotalPower.set(TotalPower.get() + amount)
@@ -213,17 +263,23 @@ def announce_delegator_leave(validator: str):
         currency.transfer(Delegators[ctx.caller, validator, "amount"], ctx.caller)
         Validators[validator, "power"] -= Delegators[ctx.caller, validator, "amount"]
         Delegators[ctx.caller, validator, "amount"] = 0
+        Delegators[ctx.caller, validator, "record"] = None
+        TotalPower.set(TotalPower.get() - Delegators[ctx.caller, validator, "amount"])
         return
 
     # Validator is unbonding
-    if Validators[validator, "unbonding"]:
+    elif Validators[validator, "unbonding"]:
         Delegators[ctx.caller, validator, "unbonding"] = Validators[validator, "unbonding"]
         Validators[validator, "power"] -= Delegators[ctx.caller, validator, "amount"]
-        return
 
     # Validator is not unbonding
-    Delegators[ctx.caller, validator, "unbonding"] = now + datetime.timedelta(days=Rules["unbonding_period"])
-    Validators[validator, "power"] -= Delegators[ctx.caller, validator, "amount"]
+    else:
+        Delegators[ctx.caller, validator, "unbonding"] = now + datetime.timedelta(days=Rules["unbonding_period"])
+        Validators[validator, "power"] -= Delegators[ctx.caller, validator, "amount"]
+
+    Delegators[ctx.caller, validator, 'record'][Epoch_I.get()] = 0
+    
+    TotalPower.set(TotalPower.get() - Delegators[ctx.caller, validator, "amount"])
 
 
 @export
@@ -236,8 +292,9 @@ def cancel_delegator_leave(validator: str):
     assert Delegators[ctx.caller, validator, "unbonding"], "Not unbonding"
 
     Delegators[ctx.caller, validator, "unbonding"] = None
+    Delegators[ctx.caller, validator, "record"][Epoch_I.get() + 1] = Delegators[ctx.caller, validator, "amount"]
     Validators[validator, "power"] += Delegators[ctx.caller, validator, "amount"]
-    
+
 
 @export
 def redelegate(from_validator: str, to_validator: str, amount: float):
@@ -260,11 +317,14 @@ def redelegate(from_validator: str, to_validator: str, amount: float):
     assert not Delegators[ctx.caller, to_validator, "unbonding"], "The 'to' delegation is unbonding, cancel the unbonding first"
 
     Delegators[ctx.caller, from_validator, "amount"] -= amount
+    Delegators[ctx.caller, from_validator, 'record'][Epoch_I.get()] -= amount
     Delegators[ctx.caller, to_validator, "amount"] += amount
+    Delegators[ctx.caller, to_validator, 'record'][Epoch_I.get() + 1] += amount
+    
     Validators[from_validator, "power"] -= amount
     Validators[to_validator, "power"] += amount
-    
-    
+
+
 @export
 def delegator_leave(validator: str):
     """

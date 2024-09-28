@@ -3,6 +3,10 @@ from contracting.stdlib.bridge.time import Datetime, Timedelta
 from contracting.client import ContractingClient
 from parameterized import parameterized
 
+from gov_utils import calculate_reward_percentage, get_validators
+
+# from gov_utils import get_validators
+
 
 class TestGovernance(unittest.TestCase):
 
@@ -18,16 +22,18 @@ class TestGovernance(unittest.TestCase):
         "node9",
         "node10",
     ]
-    
+
     RULES = {
-            "v_max": 2,
-            "v_lock": 100,
-            "v_min_commission": 5,
-            "fee_dist": [0.4, 0.3, 0.1, 0.2],
-            "unbonding_period": 7,
-            "epoch_length": 8,
-        }
-    
+        "v_max": 2,
+        "v_lock": 100,
+        "v_min_commission": 5,
+        "fee_dist": [0.4, 0.3, 0.1, 0.2],
+        "unbonding_period": 7,
+        "epoch_length": 8,
+        "min_vote_turnout": 0.5,
+        "min_vote_ratio": 0.7,
+    }
+
     GENESIS_NODES = ["node1", "node2"]
 
     def setUp(self):
@@ -35,18 +41,14 @@ class TestGovernance(unittest.TestCase):
         self.client = ContractingClient()
         self.client.flush()
 
-        with open("currency.py") as f:
-            code = f.read()
-            self.client.submit(code, name="currency", constructor_args={"vk": "sys"})
-
-        self.currency = self.client.get_contract("currency")
-        
         gov_contract_name = "gov"
+        currency_contract_name = "currency"
+
+        self.setup_currency_contract(currency_contract_name, gov_contract_name)
+        self.currency = self.client.get_contract("currency")
 
         self.setup_gov_contract(gov_contract_name, self.RULES, self.GENESIS_NODES)
-        
         self.gov = self.client.get_contract(gov_contract_name)
-
 
         self.setup_nodes_currency(self.NODES, gov_contract_name)
 
@@ -54,11 +56,23 @@ class TestGovernance(unittest.TestCase):
         # Called after every test, ensures each test starts with a clean slate and is isolated from others
         self.client.flush()
 
-    def setup_nodes_currency(self, nodes, contract_name):
+    def setup_nodes_currency(
+        self, nodes, gov_contract_name, currency_contract_name="currency"
+    ):
+        currency_contract = self.client.get_contract(currency_contract_name)
         for node in nodes:
-            self.currency.transfer(amount=10000, to=node, signer="sys")
-            self.currency.approve(amount=10000, to=contract_name, signer=node)
-            
+            currency_contract.transfer(amount=10000, to=node, signer="sys")
+            currency_contract.approve(amount=10000, to=gov_contract_name, signer=node)
+
+    def setup_currency_contract(self, contract_name, gov_contract_name):
+        with open("currency.py") as f:
+            code = f.read()
+            self.client.submit(
+                code,
+                contract_name,
+                constructor_args={"vk": "sys", "gov_contract": gov_contract_name},
+            )
+
     def setup_gov_contract(self, contract_name, rules, genesis_nodes):
         with open("gov.py") as f:
             code = f.read()
@@ -339,89 +353,33 @@ class TestGovernance(unittest.TestCase):
         self.assertEqual(self.gov.Delegators["node3", "node2", "amount"], 100)
         self.assertEqual(self.gov.Delegators["node3", "node2", "epoch_joined"], 2)
 
-    def get_available_validators(self, gov_contract_name="gov"):
-        driver = self.client.raw_driver
-
-        all_validators_data = driver.items(f"{gov_contract_name}.Validators")
-        keys = list(all_validators_data.keys())
-        values = list(all_validators_data.values())
-
-        all_validators_dict = {}
-        all_validators = []
-        available_validator_accounts = []
-        available_validators = []
-        unbonding_validator_accounts = []
-        unbonding_validators = []
-        inactive_validator_accounts = []
-        inactive_validators = []
-
-        for i, key in enumerate(keys):
-            parts = key.split(":")
-            
-            validator_account = parts[1]
-            all_validators.append(validator_account)
-                
-            if validator_account not in all_validators_dict:
-                all_validators_dict[validator_account] = {
-                    "account": validator_account,
-                }
-            if len(parts) == 3:
-                all_validators_dict[validator_account][parts[2]] = values[i]
-        
-        all_validators = list(set(all_validators))
-
-        for v in all_validators:
-            parts = key.split(":")
-
-            is_unbonding = all_validators_data.get(f"{gov_contract_name}.Validators:{v}:unbonding")
-            is_active = all_validators_data.get(f"{gov_contract_name}.Validators:{v}:active")
-
-            if is_unbonding:
-                unbonding_validator_accounts.append(v)
-            if not is_active:
-                inactive_validator_accounts.append(v)
-            if is_active and not is_unbonding:
-                available_validator_accounts.append(v)
-
-        for v in available_validator_accounts:
-            available_validators.append(all_validators_dict[v])
-            
-        for v in unbonding_validator_accounts:
-            unbonding_validators.append(all_validators_dict[v])
-            
-        for v in inactive_validator_accounts:
-            inactive_validators.append(all_validators_dict[v])
-
-        return available_validators, inactive_validators, unbonding_validators
-
     @parameterized.expand(
         [ # (genesis, unbonding, inactive)
             (["node1", "node2"], ["node3", "node4", "node5"], ["node6", "node7", "node8"]),
-            (["node1", "node2", "node3", "node4"], ["node5"], ["node6", "node7", "node8"]),           
-            (["node1", "node2", "node3", "node4"], ["node5", "node6"], ["node7", "node8"]),            
-            (["node1", "node2", "node3", "node4", "node5", "node6"], [], ["node7", "node8"]),            
-            (["node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8"], [], []),            
+            (["node1", "node2", "node3", "node4"], ["node5"], ["node6", "node7", "node8"]),
+            (["node1", "node2", "node3", "node4"], ["node5", "node6"], ["node7", "node8"]),
+            (["node1", "node2", "node3", "node4", "node5", "node6"], [], ["node7", "node8"]),
+            (["node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8"], [], []),
         ]
     )
     def test_get_validators(self, genesis_nodes, unbonding, inactive):
         JOIN_DATE = Datetime(year=2021, month=1, day=1, hour=0)
         LEAVE_DATE = Datetime(year=2021, month=1, day=8, hour=0)
-        
+
         gov_contract_name = "gov_local"
         self.setup_gov_contract(gov_contract_name, self.RULES, genesis_nodes)
-        
+
         gov = self.client.get_contract(gov_contract_name)
         self.setup_nodes_currency(self.NODES, gov_contract_name)
-        
+
         for node in unbonding + inactive:
             gov.join(commission=5, signer=node, environment={"now": JOIN_DATE})
             gov.announce_validator_leave(signer=node, environment={"now": JOIN_DATE})
 
         for node in inactive:
             gov.validator_leave(signer=node, environment={"now": LEAVE_DATE})
-            
-        available_validators, inactive_validators_accounts, unbonding_validator_accounts = self.get_available_validators(gov_contract_name)
 
+        available_validators, inactive_validators_accounts, unbonding_validator_accounts = get_validators(self.client.raw_driver, gov_contract_name)
         for v in available_validators:
             assert v["account"] in genesis_nodes
         for v in unbonding_validator_accounts:
@@ -432,76 +390,114 @@ class TestGovernance(unittest.TestCase):
     @parameterized.expand(
         [ # (genesis, joined_later, inactive)
             (["node1", "node2"], ["node3", "node4", "node5"], ["node6", "node7", "node8"]),
-            (["node1", "node2", "node3", "node4"], ["node5"], ["node6", "node7", "node8"]),           
-            (["node1", "node2", "node3", "node4"], ["node5", "node6"], ["node7", "node8"]),            
-            (["node1", "node2", "node3", "node4", "node5", "node6"], [], ["node7", "node8"]),            
-            (["node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8"], [], []),            
+            (["node1", "node2", "node3", "node4"], ["node5"], ["node6", "node7", "node8"]),
+            (["node1", "node2", "node3", "node4"], ["node5", "node6"], ["node7", "node8"]),
+            (["node1", "node2", "node3", "node4", "node5", "node6"], [], ["node7", "node8"]),
+            (["node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8"], [], []),
         ]
     )
     def test_get_validators_joined_later(self, genesis_nodes, joined_later, inactive):
         JOIN_DATE = Datetime(year=2021, month=1, day=1, hour=0)
         LEAVE_DATE = Datetime(year=2021, month=1, day=8, hour=0)
-        
+
         gov_contract_name = "gov_local"
         self.setup_gov_contract(gov_contract_name, self.RULES, genesis_nodes)
-        
+
         gov = self.client.get_contract(gov_contract_name)
         self.setup_nodes_currency(self.NODES, gov_contract_name)
-        
+
         for node in joined_later:
             gov.join(commission=5, signer=node, environment={"now": JOIN_DATE})
-        
+
         for node in inactive:
             gov.join(commission=5, signer=node, environment={"now": JOIN_DATE})
             gov.announce_validator_leave(signer=node, environment={"now": JOIN_DATE})
             gov.validator_leave(signer=node, environment={"now": LEAVE_DATE})
-            
-        available_validators, inactive_validators_accounts, unbonding_validator_accounts = self.get_available_validators(gov_contract_name)
+
+        available_validators, inactive_validators_accounts, unbonding_validator_accounts = get_validators(self.client.raw_driver, gov_contract_name)
 
         for v in available_validators:
             assert v["account"] in genesis_nodes + joined_later
         for v in inactive_validators_accounts:
             assert v["account"] in inactive
-        
 
     @parameterized.expand(
         [ # (genesis, joined_later, leave_rejoin, leave_rejoin_announce_leave)
             (["node1", "node2"], ["node3", "node4", "node5"], ["node6", "node7", "node8"], ["node9", "node10"]),
-            (["node1", "node2", "node3", "node4"], ["node5"], ["node6", "node7", "node8", "node9"], ["node10"]),           
-            (["node1", "node2", "node3", "node4"], ["node5", "node6"], ["node7", "node8"], ["node9", "node10"]),            
-            (["node1", "node2", "node3", "node4", "node5", "node6"], [], ["node7", "node8"], ["node9", "node10"]),            
-            (["node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8"], [], [], ["node9", "node10"]),            
+            (["node1", "node2", "node3", "node4"], ["node5"], ["node6", "node7", "node8", "node9"], ["node10"]),
+            (["node1", "node2", "node3", "node4"], ["node5", "node6"], ["node7", "node8"], ["node9", "node10"]),
+            (["node1", "node2", "node3", "node4", "node5", "node6"], [], ["node7", "node8"], ["node9", "node10"]),
+            (["node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8"], [], [], ["node9", "node10"]),
         ]
     )
     def test_get_validators_leave_rejoin(self, genesis_nodes, joined_later, leave_rejoin, leave_rejoin_announce_leave):
         JOIN_DATE = Datetime(year=2021, month=1, day=1, hour=0)
         LEAVE_DATE = Datetime(year=2021, month=1, day=8, hour=0)
-        
+
         gov_contract_name = "gov_local"
         self.setup_gov_contract(gov_contract_name, self.RULES, genesis_nodes)
-        
+
         gov = self.client.get_contract(gov_contract_name)
         self.setup_nodes_currency(self.NODES, gov_contract_name)
-        
+
         for node in joined_later:
             gov.join(commission=5, signer=node, environment={"now": JOIN_DATE})
-        
+
         for node in leave_rejoin + leave_rejoin_announce_leave:
             gov.join(commission=5, signer=node, environment={"now": JOIN_DATE})
             gov.announce_validator_leave(signer=node, environment={"now": JOIN_DATE})
             gov.validator_leave(signer=node, environment={"now": LEAVE_DATE})
             gov.join(commission=5, signer=node, environment={"now": LEAVE_DATE})
-            
+
         for node in leave_rejoin_announce_leave:
             leave_rejoin_leaveannounce__date = LEAVE_DATE + Timedelta(days=1)
             gov.announce_validator_leave(signer=node, environment={"now": leave_rejoin_leaveannounce__date})
 
-        available_validators, inactive_validators_accounts, unbonding_validator_accounts = self.get_available_validators(gov_contract_name)
+        available_validators, inactive_validators_accounts, unbonding_validator_accounts = get_validators(self.client.raw_driver, gov_contract_name)
 
         for v in available_validators:
             assert v["account"] in genesis_nodes + joined_later + leave_rejoin
         for v in unbonding_validator_accounts:
             assert v["account"] in leave_rejoin_announce_leave
+
+    # @parameterized.expand(
+    #     [
+    #         # (0.1, 18.8),
+    #         # (0.2, 18.8),
+    #         # (0.3, 10),
+    #         # (0.4, 9.88),
+    #         # (0.5, 8.18),
+    #         # (0.6, 5.12),
+    #         # (0.7, 5.12),
+    #         # (0.73, 5.12),
+    #         # (0.74, 5.12),
+    #         # (0.749, 5.12),
+    #         (0.8, 5.12),
+    #         (0.9, 5.12),
+    #         (1, 5.12),
+    #     ]
+    # )
+    # def test_calculate_reward_percentage(self, staked, expected_reward):
+    #     # Example usage
+    #     staked_target = 0.75
+    #     reward_min = 0.05
+    #     reward_max = 0.35
+    #     reward_target = 0.05
+
+    #     reward_percentage = calculate_reward_percentage(
+    #         staked,
+    #         staked_target,
+    #         reward_target,
+    #         reward_max,
+    #         reward_min,
+    #     )
+    #     self.assertAlmostEqual(
+    #         reward_percentage,
+    #         expected_reward,
+    #         places=2,
+    #         msg=f"Staked Amount: {staked}, Expected Reward Percentage: {expected_reward}%, Got: {reward_percentage:.2f}%",
+    #     )
+
 
 if __name__ == "__main__":
     unittest.main()
